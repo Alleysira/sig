@@ -5,6 +5,10 @@ pub const Cluster = enum(u8) {
     testnet = 0,
     mainnet = 1,
     devnet = 2,
+    /// Local development cluster (e.g. a Kurtosis enclave testnet).
+    /// The caller must provide entrypoints manually via the development
+    /// startup path in main.zig (getFromEcho is bypassed for this cluster).
+    development = 3,
 
     /// Returns entrypoints for public clusters, null for development.
     /// For development this returns an empty list, because the caller
@@ -30,6 +34,8 @@ pub const Cluster = enum(u8) {
                 "entrypoint4.devnet.solana.com:8001",
                 "entrypoint5.devnet.solana.com:8001",
             },
+            // Development entrypoints are provided manually at startup.
+            .development => &.{},
         };
     }
 
@@ -39,6 +45,7 @@ pub const Cluster = enum(u8) {
             .mainnet => "https://api.mainnet-beta.solana.com",
             .testnet => "https://api.testnet.solana.com",
             .devnet => "https://api.devnet.solana.com",
+            .development => "", // no public RPC for a local cluster
         };
     }
 };

@@ -28,6 +28,13 @@ pub const SnapshotConfig = extern struct {
     /// NOTE: When true, `known_validators_len` is 0.
     known_validators_allow_all: bool,
 
+    /// Tracked deviation (development-only): when true AND no existing snapshot
+    /// is on disk, the snapshot service skips the gossip snapshot download
+    /// (which fatally fails on a slot-0 local cluster that never advertises a
+    /// snapshot) and instead signals an empty snapshot to accounts_db, then
+    /// idle-spins. Keeps SIG alive as a non-voting observer. See DEVIATIONS.md.
+    skip_on_cold_start: bool,
+
     pub const KnownValidators = union(enum) {
         allow_all,
         set: []const lib.solana.Pubkey,

@@ -52,10 +52,26 @@ const Config = struct {
     const Gossip = struct {
         port: u16,
         advertise_tvu_port: bool,
+
+        // ── development-only (tracked deviation) ──────────────────────────────
+        // When cluster == .development, these bypass the public echo handshake.
+        // advertise_ip is the reachable IP this observer advertises to peers
+        // (the launcher resolves it via `hostname -I`). development_entrypoints
+        // is the list of "host:port" gossip entrypoints to seed (e.g. the
+        // bootstrap validator). Both default empty so public-cluster configs
+        // (testnet/mainnet/devnet) are unaffected.
+        advertise_ip: []const u8 = "",
+        development_entrypoints: []const []const u8 = &.{},
     };
 
     const ShredNetwork = struct {
         recv_port: u16,
+
+        // ── development-only ──────────────────────────────────────────────────
+        // shred_version is normally discovered via the echo handshake. For a
+        // local development cluster we read it from config (the genesis
+        // generator emits it).
+        shred_version: u16 = 0,
     };
 
     const Telemetry = struct {
@@ -66,6 +82,15 @@ const Config = struct {
     const Snapshot = struct {
         folder: []const u8,
         known_validators: []const []const u8,
+
+        // ── development-only (tracked deviation) ──────────────────────────────
+        // When true AND no existing snapshot is on disk, the snapshot service
+        // skips the gossip snapshot download (which would fatally fail on a
+        // slot-0 local cluster that never advertises a snapshot) and instead
+        // signals an empty snapshot to accounts_db, then idle-spins. This keeps
+        // SIG alive as a non-voting observer; it will NOT have the full account
+        // set (research-grade relaxation, observer-only).
+        skip_on_cold_start: bool = false,
     };
 
     const AccountsDb = struct {
@@ -211,8 +236,16 @@ pub fn main() !void {
 
     std.log.info("config: {f}", .{config.zonFmt(.{})});
 
-    const gossip_cluster_info: gossip.ClusterInfo =
-        try .getFromEcho(config.gossip.port, config.cluster);
+    // ── Gossip cluster info ──────────────────────────────────────────────────
+    // Public clusters (testnet/mainnet/devnet): discover entrypoints + our
+    // public IP + shred version via the echo handshake. For a local development
+    // cluster (isolated Kurtosis enclave), no public entrypoint responds, so we
+    // construct ClusterInfo manually from config-provided entrypoints + advertise
+    // IP + shred version. This is a tracked source deviation (see DEVIATIONS.md).
+    const gossip_cluster_info: gossip.ClusterInfo = switch (config.cluster) {
+        .development => try clusterInfoFromConfig(config),
+        else => try .getFromEcho(config.gossip.port, config.cluster),
+    };
 
     const schedule_file = try std.fs.cwd().openFile(config.leader_schedule_file, .{});
     defer schedule_file.close();
@@ -387,6 +420,76 @@ pub fn main() !void {
     tracy.message("exiting");
 }
 
+/// Build a `gossip.ClusterInfo` for a local development cluster without the
+/// echo handshake. Mirrors `getFromEcho`'s address-resolution + dedup logic,
+/// but: (1) entrypoints come from `config.gossip.development_entrypoints`,
+/// (2) shred_version comes from `config.shred_network.shred_version`,
+/// (3) public_ip comes from `config.gossip.advertise_ip` (resolved by the
+/// launcher, e.g. `hostname -I`). Tracked deviation — see DEVIATIONS.md.
+fn clusterInfoFromConfig(config: Config) !gossip.ClusterInfo {
+    var result: gossip.ClusterInfo = undefined;
+    result.entry_addrs_len = 0;
+    result.shred_version = config.shred_network.shred_version;
+
+    // Resolve our advertised public IP from config (a string "a.b.c.d").
+    if (config.gossip.advertise_ip.len == 0) {
+        std.log.err(
+            "development cluster requires gossip.advertise_ip (this observer's " ++
+                "reachable IP, e.g. set by the launcher via `hostname -I`)",
+            .{},
+        );
+        return error.NoDevelopmentAdvertiseIp;
+    }
+    const self_ip = std.net.Address.parseIp4(config.gossip.advertise_ip, config.gossip.port) catch |err| {
+        std.log.err("invalid advertise_ip '{s}': {s}", .{ config.gossip.advertise_ip, @errorName(err) });
+        return err;
+    };
+    result.public_ip = .fromNetAddress(self_ip);
+
+    // Resolve each development entrypoint ("host:port") to an address.
+    for (config.gossip.development_entrypoints) |entrypoint| {
+        const split = std.mem.indexOfScalar(u8, entrypoint, ':') orelse {
+            std.log.warn("development entrypoint '{s}' has no :port, skipping", .{entrypoint});
+            continue;
+        };
+        const port = std.fmt.parseInt(u16, entrypoint[split + 1 ..], 10) catch {
+            std.log.warn("development entrypoint '{s}' has invalid port, skipping", .{entrypoint});
+            continue;
+        };
+
+        var addr_buf: [4096]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&addr_buf);
+        const addr_list = std.net.getAddressList(fba.allocator(), entrypoint[0..split], port) catch |err| {
+            std.log.warn("development entrypoint '{s}' did not resolve: {s}", .{ entrypoint, @errorName(err) });
+            continue;
+        };
+        defer addr_list.deinit();
+
+        for (addr_list.addrs) |entry_addr| {
+            if (result.entry_addrs_len >= gossip.ClusterInfo.MAX_ENTRY_ADDRS) break;
+
+            const new_entry_addr: gossip.Address = .fromNetAddress(entry_addr);
+            const exists = for (result.getEntryAddresses()) |e| {
+                if (std.meta.eql(e, new_entry_addr)) break true;
+            } else false;
+            if (!exists) {
+                result.entry_addrs[result.entry_addrs_len] = new_entry_addr;
+                result.entry_addrs_len += 1;
+            }
+            break; // only one resolved address per entrypoint hostname
+        }
+    }
+
+    if (result.entry_addrs_len == 0) {
+        std.log.err(
+            "development cluster resolved zero gossip entrypoints (check config.gossip.development_entrypoints)",
+            .{},
+        );
+        return error.NoValidEntrypoint;
+    }
+    return result;
+}
+
 fn populateSnapshotConfig(
     data: *snapshot.SnapshotConfig,
     cfg: Config.Snapshot,
@@ -407,6 +510,7 @@ fn populateSnapshotConfig(
     @memcpy(data.folder_buffer[0..cfg.folder.len], cfg.folder);
     data.folder_len = @intCast(cfg.folder.len);
     data.cluster = cluster;
+    data.skip_on_cold_start = cfg.skip_on_cold_start;
 
     const has_wildcard = for (cfg.known_validators) |entry| {
         if (std.mem.eql(u8, entry, "*")) break true;
